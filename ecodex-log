@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fatal(){ printf 'ecodex-log: %s\n' "$1" >&2; exit 1; }
+[[ $# -eq 1 ]] || fatal "usage: ecodex-log <RUN_ID>"
+LOG_DIR="$HOME/.ecodex/logs"
+LOG_FILE="${LOG_DIR}/$1.log"
+[[ -f "$LOG_FILE" ]] || fatal "log not found: $LOG_FILE"
+exec tail -f "$LOG_FILE"
