@@ -4,35 +4,33 @@ set -euo pipefail
 fatal(){ printf 'ecodex: %s\n' "$1" >&2; exit "${2:-1}"; }
 need(){ command -v "$1" >/dev/null 2>&1 || fatal "missing dependency: $1"; }
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)
-get_version(){ local ver; if command -v git >/dev/null 2>&1; then ver=$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null || true); [[ -n $ver ]] && { printf '%s' "$ver"; return; }; fi; printf 'unknown'; }
+get_version(){ local v; if command -v git >/dev/null 2>&1; then v=$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null || true); [[ -n $v ]] && { printf '%s' "$v"; return; }; fi; printf 'unknown'; }
+
+LAST_LOG_FILE=""
 run_codex(){
-  local prompt="$1" log_dir="$HOME/.ecodex/logs" primary_log fallback_log final_log
-  mkdir -p "$log_dir"
-  primary_log=$(mktemp "$log_dir/primary.XXXXXX.log")
-  fallback_log=$(mktemp "$log_dir/fallback.XXXXXX.log")
-  final_log="$log_dir/last-run.log"
-  trap 'rm -f "$primary_log" "$fallback_log"' RETURN
+  local prompt="$1" log_dir="$HOME/.ecodex/logs" run_id log_file
+  mkdir -p "$log_dir" || fatal "unable to create $log_dir"
+  run_id="$(date +%Y%m%d%H%M%S)-$RANDOM"
+  log_file="$log_dir/$run_id.log"
+  : >"$log_file" || fatal "unable to write log file"
+  LAST_LOG_FILE="$log_file"
+  ln -sf "$log_file" "$log_dir/last-run.log" 2>/dev/null || true
 
-  if timeout -k 5 120s env CI=1 NO_COLOR=1 CLICOLOR=0 TERM=dumb codex --model gpt-5 "$prompt" </dev/null >"$primary_log" 2>&1; then
-    cp "$primary_log" "$final_log"
-    cat "$primary_log"
+  tee >&2 <<INFO
+ecodex: log started at $log_file
+INFO
+
+  printf 'timestamp_utc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$log_file"
+  if timeout -k 5 120s env CI=1 NO_COLOR=1 CLICOLOR=0 TERM=dumb codex exec --model gpt-5 -- "$prompt" \
+      >>"$log_file" 2>&1; then
+    cat "$log_file"
     return 0
   fi
-
-  local primary_output
-  primary_output=$(cat "$primary_log")
-
-  if timeout -k 5 180s env TERM=xterm PROMPT_TEXT="$prompt" script -q -c 'codex --model gpt-5 "$PROMPT_TEXT"' /dev/null >"$fallback_log" 2>&1; then
-    cp "$fallback_log" "$final_log"
-    cat "$fallback_log"
-    return 0
-  fi
-
-  cp "$fallback_log" "$final_log" 2>/dev/null || true
-  printf '%s\n' "$primary_output" >&2
-  cat "$fallback_log" >&2
+  printf 'ecodex: codex exec failed, see %s\n' "$log_file" >&2
+  cat "$log_file" >&2
   fatal "codex invocation failed"
 }
+
 parse_issue(){ local ref="$1"; PARSED_OWNER=""; PARSED_REPO=""; PARSED_NUMBER=""; if [[ $ref =~ ^https://github.com/([^/]+)/([^/]+)/issues/([0-9]+)$ ]]; then PARSED_OWNER="${BASH_REMATCH[1]}"; PARSED_REPO="${BASH_REMATCH[2]}"; PARSED_NUMBER="${BASH_REMATCH[3]}"; return 0; fi; if [[ $ref =~ ^([0-9]+)$ ]]; then PARSED_NUMBER="${BASH_REMATCH[1]}"; return 0; fi; fatal "invalid issue reference: $ref"; }
 resolve_repo(){ local override="$1" owner="$2" repo="$3"; if [[ -n $override ]]; then printf '%s\n' "$override"; return; fi; if [[ -n $owner && -n $repo ]]; then printf '%s/%s\n' "$owner" "$repo"; return; fi; if [[ -n ${DEFAULT_REPO:-} ]]; then printf '%s\n' "$DEFAULT_REPO"; return; fi; DEFAULT_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true); [[ -n $DEFAULT_REPO ]] || fatal "unable to determine repository; use --repo"; printf '%s\n' "$DEFAULT_REPO"; }
 fetch_issue_body(){ local repo="$1" num="$2"; gh api "repos/${repo}/issues/${num}" --jq '.body' || fatal "failed to fetch issue #${num} from ${repo}"; }
@@ -56,42 +54,36 @@ PROMPT_TEXT="${ECODEX_PROMPT_DATA:-}"; PROMPT_SOURCE="${ECODEX_PROMPT_SOURCE:-}"
 
 while (($#)); do
   case "$1" in
-    --prompt)
-      (($#>1)) || fatal "missing value for --prompt"; [[ -n $PROMPT_SOURCE && $PROMPT_SOURCE != env ]] && fatal "multiple prompt sources"; PROMPT_TEXT="$2"; PROMPT_SOURCE=inline; shift 2;;
-    --prompt-file)
-      (($#>1)) || fatal "missing value for --prompt-file"; [[ -n $PROMPT_SOURCE && $PROMPT_SOURCE != env ]] && fatal "multiple prompt sources"; [[ -f $2 ]] || fatal "prompt file not found: $2"; PROMPT_TEXT="$(cat "$2")"; PROMPT_SOURCE=file; shift 2;;
-    --prompt-issue)
-      (($#>1)) || fatal "missing value for --prompt-issue"; [[ -n $PROMPT_SOURCE && $PROMPT_SOURCE != env ]] && fatal "multiple prompt sources"; PROMPT_ISSUE_REF="$2"; PROMPT_SOURCE=issue; shift 2;;
-    --issue)
-      (($#>1)) || fatal "missing value for --issue"; TARGET_ISSUE_REF="$2"; shift 2;;
-    --repo)
-      (($#>1)) || fatal "missing value for --repo"; REPO_OVERRIDE="$2"; shift 2;;
-    --title)
-      (($#>1)) || fatal "missing value for --title"; TITLE="$2"; shift 2;;
-    --attach-prompt)
-      ATTACH_PROMPT=1; shift;;
-    --bg)
-      (( BG_CHILD == 1 )) && fatal "--bg not allowed in background child"; BG_MODE=1; shift;;
-    --test)
-      TEST_MODE=1; shift;;
-    --dry-run)
-      DRY_RUN=1; shift;;
-    -h|--help)
-      usage; exit 0;;
-    --)
-      shift; break;;
-    *)
-      fatal "unknown option: $1";;
+    --prompt) (($#>1)) || fatal "missing value for --prompt"; [[ -n $PROMPT_SOURCE && $PROMPT_SOURCE != env ]] && fatal "multiple prompt sources"; PROMPT_TEXT="$2"; PROMPT_SOURCE=inline; shift 2;;
+    --prompt-file) (($#>1)) || fatal "missing value for --prompt-file"; [[ -n $PROMPT_SOURCE && $PROMPT_SOURCE != env ]] && fatal "multiple prompt sources"; [[ -f $2 ]] || fatal "prompt file not found: $2"; PROMPT_TEXT="$(cat "$2")"; PROMPT_SOURCE=file; shift 2;;
+    --prompt-issue) (($#>1)) || fatal "missing value for --prompt-issue"; [[ -n $PROMPT_SOURCE && $PROMPT_SOURCE != env ]] && fatal "multiple prompt sources"; PROMPT_ISSUE_REF="$2"; PROMPT_SOURCE=issue; shift 2;;
+    --issue) (($#>1)) || fatal "missing value for --issue"; TARGET_ISSUE_REF="$2"; shift 2;;
+    --repo) (($#>1)) || fatal "missing value for --repo"; REPO_OVERRIDE="$2"; shift 2;;
+    --title) (($#>1)) || fatal "missing value for --title"; TITLE="$2"; shift 2;;
+    --attach-prompt) ATTACH_PROMPT=1; shift;;
+    --bg) (( BG_CHILD == 1 )) && fatal "--bg not allowed in background child"; BG_MODE=1; shift;;
+    --test) TEST_MODE=1; shift;;
+    --dry-run) DRY_RUN=1; shift;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    *) fatal "unknown option: $1";;
   esac
 done
 
 if (( TEST_MODE )); then
-  need codex; VERSION_STRING=$(get_version); RUN_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ"); TEST_PROMPT="Respond with \"hello world\". CLI version: ${VERSION_STRING}. Date: ${RUN_TS}."; run_codex "$TEST_PROMPT"; printf 'Log: %s\n' "$HOME/.ecodex/logs/last-run.log"; exit 0
+  need codex
+  VERSION_STRING=$(get_version)
+  RUN_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  TEST_PROMPT="Respond with \"hello world\". CLI version: ${VERSION_STRING}. Date: ${RUN_TS}."
+  run_codex "$TEST_PROMPT"
+  printf 'Log: %s\n' "$LAST_LOG_FILE"
+  exit 0
 fi
 
 if [[ -z $PROMPT_SOURCE ]]; then
   if [[ -t 0 ]]; then fatal "no prompt provided"; fi
-  PROMPT_TEXT="$(cat)"; PROMPT_SOURCE=stdin
+  PROMPT_TEXT="$(cat)"
+  PROMPT_SOURCE=stdin
 fi
 
 if [[ $PROMPT_SOURCE == issue ]]; then
@@ -101,18 +93,52 @@ fi
 [[ -n $PROMPT_TEXT ]] || fatal "prompt is empty"
 
 if (( BG_MODE )); then
-  LOG_DIR="$HOME/.ecodex/logs"; mkdir -p "$LOG_DIR"; RUN_ID="$(date +%Y%m%d%H%M%S)-$RANDOM"; LOG_FILE="$LOG_DIR/$RUN_ID.log"; nohup env ECODEX_BG_CHILD=1 ECODEX_PROMPT_DATA="$PROMPT_TEXT" ECODEX_PROMPT_SOURCE=env ECODEX_TARGET_ISSUE_REF="$TARGET_ISSUE_REF" ECODEX_REPO_OVERRIDE="$REPO_OVERRIDE" ECODEX_TITLE="$TITLE" ECODEX_ATTACH_PROMPT="$ATTACH_PROMPT" ECODEX_DRY_RUN="$DRY_RUN" ECODEX_PROMPT_OWNER="$PROMPT_I_OWNER" ECODEX_PROMPT_REPO="$PROMPT_I_REPO" ECODEX_PROMPT_NUM="$PROMPT_I_NUM" "$0" >"$LOG_FILE" 2>&1 &
-  printf 'RUN_ID=%s\nLOG=%s\n' "$RUN_ID" "$LOG_FILE"; exit 0
+  LOG_DIR="$HOME/.ecodex/logs"
+  mkdir -p "$LOG_DIR"
+  RUN_ID="$(date +%Y%m%d%H%M%S)-$RANDOM"
+  LOG_FILE="$LOG_DIR/$RUN_ID.log"
+  nohup env \
+    ECODEX_BG_CHILD=1 \
+    ECODEX_PROMPT_DATA="$PROMPT_TEXT" \
+    ECODEX_PROMPT_SOURCE=env \
+    ECODEX_TARGET_ISSUE_REF="$TARGET_ISSUE_REF" \
+    ECODEX_REPO_OVERRIDE="$REPO_OVERRIDE" \
+    ECODEX_TITLE="$TITLE" \
+    ECODEX_ATTACH_PROMPT="$ATTACH_PROMPT" \
+    ECODEX_DRY_RUN="$DRY_RUN" \
+    "$0" >"$LOG_FILE" 2>&1 &
+  printf 'RUN_ID=%s\nLOG=%s\n' "$RUN_ID" "$LOG_FILE"
+  exit 0
 fi
 
-need codex; (( DRY_RUN )) || need gh; VERSION_STRING=$(get_version); RUN_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ"); CODEX_OUTPUT="$(run_codex "$PROMPT_TEXT")"; BODY="*ecodex ${VERSION_STRING} @ ${RUN_TS} UTC*\n\n## Codex Output\n\n${CODEX_OUTPUT}"; if (( ATTACH_PROMPT )); then BODY+="\n\n---\n\n**Prompt**\n\n${PROMPT_TEXT}"; fi
+need codex
+(( DRY_RUN )) || need gh
+VERSION_STRING=$(get_version)
+RUN_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+CODEX_OUTPUT="$(run_codex "$PROMPT_TEXT")"
+BODY="*ecodex ${VERSION_STRING} @ ${RUN_TS} UTC*\n\n## Codex Output\n\n${CODEX_OUTPUT}"
+if (( ATTACH_PROMPT )); then BODY+="\n\n---\n\n**Prompt**\n\n${PROMPT_TEXT}"; fi
 
-if (( DRY_RUN )); then printf '%s\n' "$BODY"; printf 'Log: %s\n' "$HOME/.ecodex/logs/last-run.log"; exit 0; fi
+if (( DRY_RUN )); then
+  printf '%s\n' "$BODY"
+  printf 'Log: %s\n' "$LAST_LOG_FILE"
+  exit 0
+fi
 
 TARGET_REPO=$(resolve_repo "$REPO_OVERRIDE" "$PROMPT_I_OWNER" "$PROMPT_I_REPO")
 
 if [[ -n $TARGET_ISSUE_REF ]]; then
-  parse_issue "$TARGET_ISSUE_REF"; [[ -n $PARSED_NUMBER ]] || fatal "destination issue missing number"; repo_to_use="$TARGET_REPO"; if [[ -n $PARSED_OWNER && -n $PARSED_REPO ]]; then repo_to_use="${PARSED_OWNER}/${PARSED_REPO}"; fi; gh issue comment "${repo_to_use}#${PARSED_NUMBER}" --body "$BODY"; printf '%s\n' "$CODEX_OUTPUT"; printf 'Log: %s\n' "$HOME/.ecodex/logs/last-run.log"; exit 0
+  parse_issue "$TARGET_ISSUE_REF"
+  [[ -n $PARSED_NUMBER ]] || fatal "destination issue missing number"
+  repo_to_use="$TARGET_REPO"
+  if [[ -n $PARSED_OWNER && -n $PARSED_REPO ]]; then repo_to_use="${PARSED_OWNER}/${PARSED_REPO}"; fi
+  gh issue comment "${repo_to_use}#${PARSED_NUMBER}" --body "$BODY"
+  printf '%s\n' "$CODEX_OUTPUT"
+  printf 'Log: %s\n' "$LAST_LOG_FILE"
+  exit 0
 fi
 
-TITLE=${TITLE:-"Codex Response $(date +%Y-%m-%dT%H:%M:%S)"}; gh issue create --repo "$TARGET_REPO" --title "$TITLE" --body "$BODY"; printf '%s\n' "$CODEX_OUTPUT"; printf 'Log: %s\n' "$HOME/.ecodex/logs/last-run.log"
+TITLE=${TITLE:-"Codex Response $(date +%Y-%m-%dT%H:%M:%S)"}
+gh issue create --repo "$TARGET_REPO" --title "$TITLE" --body "$BODY"
+printf '%s\n' "$CODEX_OUTPUT"
+printf 'Log: %s\n' "$LAST_LOG_FILE"

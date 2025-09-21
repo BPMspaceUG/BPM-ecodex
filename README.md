@@ -52,4 +52,4 @@ A quick integration test is available:
 ```sh
 ecodex --test
 ```
-The test invokes Codex, embeds the current ecodex version and UTC timestamp in the prompt, and prints a `hello world` response without touching GitHub.
+The test invokes Codex, embeds the current ecodex version and UTC timestamp in the prompt, writes the transcript to `~/.ecodex/logs/last-run.log`, and prints a `hello world` response without touching GitHub.
